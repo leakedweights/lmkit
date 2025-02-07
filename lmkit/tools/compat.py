@@ -17,7 +17,7 @@ def from_hf(repo, out_dir, api_key=None):
     )
 
 
-def assemble_for_jax(st_dir):
+def gather_for_jax(st_dir):
     params = {}
 
     st_files = sorted(
@@ -40,7 +40,7 @@ def assemble_for_jax(st_dir):
     return frozen_params
 
 
-def gemma_to_lmkit(model_tensors):
+def params_to_lmkit(model_tensors):
     new_dict = {}
 
     for full_key, tensor in model_tensors.items():
@@ -84,4 +84,16 @@ def gemma_to_lmkit(model_tensors):
                 layers_list[idx] = value
             new_dict["layers"] = layers_list
 
+    def collapse_leaf_dicts(d):
+        if isinstance(d, dict):
+            new_d = {k: collapse_leaf_dicts(v) for k, v in d.items()}
+            if set(new_d.keys()) == {"weight"}:
+                return new_d["weight"]
+            return new_d
+        elif isinstance(d, list):
+            return [collapse_leaf_dicts(item) for item in d]
+        else:
+            return d
+
+    new_dict = collapse_leaf_dicts(new_dict)
     return new_dict
