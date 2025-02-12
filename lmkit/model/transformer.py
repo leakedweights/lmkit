@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-
+from einops import rearrange
 from functools import partial
 
 has_cuda = jax.default_backend == "gpu"
@@ -67,10 +67,12 @@ def attention(inputs, lengths, cache, params, config):
         window_size = (config["sliding_window_size"], 0)
 
     query = jnp.dot(inputs, params["W_q"])
+    query = rearrange(query, "t (n h) -> t n h", n=config["num_heads"])
     query = rope(query, config["rope_base"])
 
-    new_key = jnp.dot(inputs, params["W_k"])
-    new_key = rope(new_key, config["rope_base"])
+    key = jnp.dot(inputs, params["W_k"])
+    key = rearrange(key, "t (n h) -> t n h", n=config["num_kv_heads"])
+    key = rope(key, config["rope_base"])
     
     new_value = jnp.dot(inputs, params["W_v"])
 
@@ -78,15 +80,15 @@ def attention(inputs, lengths, cache, params, config):
         cached_key = cache.get("k", None)
         cached_value = cache.get("v", None)
         if cached_key is None:
-            full_key = new_key
+            full_key = key
             full_value = new_value
         else:
-            full_key = jnp.concatenate([cached_key, new_key], axis=1)
-            full_value = jnp.concatenate([cached_value, new_value], axis=1)
+            full_key = jnp.concatenate([cached_key, key], axis=0) # concat along token dim
+            full_value = jnp.concatenate([cached_value, new_value], axis=0)
         cache["k"] = full_key
         cache["v"] = full_value
     else:
-        full_key = new_key
+        full_key = key
         full_value = new_value
 
     x = jax.nn.dot_product_attention(
@@ -99,8 +101,11 @@ def attention(inputs, lengths, cache, params, config):
         local_window_size=window_size,
         implementation=attn_impl,
     )
+
+    x = rearrange(x, "t n h -> t (n h)")
     x = jnp.dot(x, params["W_out"])
-    return x
+        
+    return x, cache
 
 @partial(jax.vmap, in_axes=(0,0,0,None,None))
 def run_decoder(inputs, lengths, cache, params, config):
@@ -109,7 +114,7 @@ def run_decoder(inputs, lengths, cache, params, config):
 
     for layer_id, (layer_params, layer_cache) in enumerate(zip(params["layers"], cache)):
         y = rms_norm(x, layer_params["input_norm"])
-        y = attention(x, lengths, layer_cache, layer_params["attn"], config)
+        y, cache[layer_id] = attention(x, lengths, layer_cache, layer_params["attn"], config)
 
         if config.get("pre_ffn_norm"): # gemma 2
             x = rms_norm(x, layer_params["post_attn_norm"])
