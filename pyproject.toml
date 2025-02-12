@@ -19,6 +19,7 @@ dependencies = [
   "array-record>=0.6.0",
   "python-dotenv>=1.0.1",
   "einops>=0.8.1",
+  "tokenizers>=0.21.0",
 ]
 
 [project.optional-dependencies]

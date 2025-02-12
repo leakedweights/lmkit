@@ -1,20 +1,26 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 from einops import rearrange
-from functools import partial
+
+from lmkit.model.positional import rope
 
 has_cuda = jax.default_backend == "gpu"
 
+
 def encode(inputs, embed_table):
-    embeddings = jnp.take(embed_table, inputs, axis=1)
+    embeddings = jnp.take(embed_table, inputs, axis=0)
     return embeddings
 
+
 def decode(inputs, embed_table):
-    dec = jnp.einsum('12,32->13', inputs, embed_table)
+    dec = jnp.einsum("12,32->13", inputs, embed_table)
     logits = dec * jnp.sqrt(embed_table.shape[-1])
     return logits
 
-def rms_norm(x, w_bias, weight, eps, convert_w=False):
+
+def rms_norm(x, weight, w_bias, eps, convert_w):
     dtype = x.dtype
     x = jnp.astype(x, jnp.float32)
 
@@ -30,51 +36,34 @@ def rms_norm(x, w_bias, weight, eps, convert_w=False):
     x = x * weight
     return jnp.astype(x, dtype)
 
-def rope(embeds, base):
-    seq_len, d_key = embeds.shape
-
-    half_dim = d_key // 2
-    positions = jnp.arange(seq_len)[:, None]
-    dim_idx = jnp.arange(half_dim)[None, :]
-    
-    theta = base ** (-2 * dim_idx / d_key)
-    
-    angles = positions * theta
-    cos = jnp.cos(angles)
-    sin = jnp.sin(angles)
-    
-    comp1, comp2 = jnp.split(embeds, 2, axis=-1)
-    
-    rotated_first  = comp1 * cos - comp2 * sin
-    rotated_second = comp1 * sin + comp2 * cos
-    
-    return jnp.concatenate([rotated_first, rotated_second], axis=-1)
 
 @partial(jax.jit, static_argnums=(2,))
 def ffn(x, params, act_fn):
-    gate = jnp.dot(x, params["W_gate"])
+    gate = jnp.einsum("ij,kj->ik", x, params["W_gate"])
     act = act_fn(gate)
-    up = jnp.dot(x, params["W_up"])
-    output = jnp.dot(act * up, params["W_down"])
+    up = jnp.einsum("ij,kj->ik", x, params["W_up"])
+    output = jnp.einsum("ij,kj->ik", act * up, params["W_down"])
 
     return output
 
-@partial(jax.jit, static_argnums=(3,4))
-def attention(inputs, lengths, cache, params, config):
+
+@partial(jax.jit, static_argnums=(4,))
+def attention(inputs, lengths, cache, params, config):  # inputs: (t, n*h)
     attn_impl = "cudnn" if has_cuda else "xla"
     window_size = None
     if config.get("apply_sliding_window", False):
         window_size = (config["sliding_window_size"], 0)
 
-    query = jnp.dot(inputs, params["W_q"])
+    query = jnp.einsum("ij,kj->ik", inputs, params["W_q"])
     query = rearrange(query, "t (n h) -> t n h", n=config["num_heads"])
     query = rope(query, config["rope_base"])
 
-    key = jnp.dot(inputs, params["W_k"])
+    key = jnp.einsum("ij,kj->ik", inputs, params["W_k"])
     key = rearrange(key, "t (n h) -> t n h", n=config["num_kv_heads"])
     key = rope(key, config["rope_base"])
-    
-    new_value = jnp.dot(inputs, params["W_v"])
+
+    new_value = jnp.einsum("ij,kj->ik", inputs, params["W_v"])
+    new_value = rearrange(new_value, "t (n h) -> t n h", n=config["num_kv_heads"])
 
     if cache is not None:
         cached_key = cache.get("k", None)
@@ -83,13 +72,17 @@ def attention(inputs, lengths, cache, params, config):
             full_key = key
             full_value = new_value
         else:
-            full_key = jnp.concatenate([cached_key, key], axis=0) # concat along token dim
+            full_key = jnp.concatenate([cached_key, key], axis=0)
             full_value = jnp.concatenate([cached_value, new_value], axis=0)
         cache["k"] = full_key
         cache["v"] = full_value
     else:
         full_key = key
         full_value = new_value
+
+    assert full_key.dtype == full_value.dtype, (
+        f"Expected {full_key.dtype}, got {full_value.dtype}"
+    )
 
     x = jax.nn.dot_product_attention(
         query=query,
@@ -103,39 +96,50 @@ def attention(inputs, lengths, cache, params, config):
     )
 
     x = rearrange(x, "t n h -> t (n h)")
-    x = jnp.dot(x, params["W_out"])
-        
+    x = jnp.einsum("ij,kj->ik", x, params["W_o"])
+
     return x, cache
 
-@partial(jax.vmap, in_axes=(0,0,0,None,None))
+
+@partial(jax.vmap, in_axes=(0, 0, 0, None, None))
 def run_decoder(inputs, lengths, cache, params, config):
-    
+    model_norm = partial(
+        rms_norm,
+        w_bias=config["norm_w_bias"],
+        eps=config["norm_eps"],
+        convert_w=config["norm_convert_w"],
+    )
+
     x = encode(inputs, params["embed_table"])
 
-    for layer_id, (layer_params, layer_cache) in enumerate(zip(params["layers"], cache)):
-        y = rms_norm(x, layer_params["input_norm"])
-        y, cache[layer_id] = attention(x, lengths, layer_cache, layer_params["attn"], config)
+    for layer_id, (layer_params, layer_cache) in enumerate(
+        zip(params["layers"], cache)
+    ):
+        y = model_norm(x, layer_params["input_norm"])
+        y, cache[layer_id] = attention(
+            x, lengths, layer_cache, layer_params["attn"], config
+        )
 
-        if config.get("pre_ffn_norm"): # gemma 2
-            x = rms_norm(x, layer_params["post_attn_norm"])
+        if config.get("pre_ffn_norm"):  # gemma 2
+            x = model_norm(x, layer_params["post_attn_norm"])
             y = x + y
-            y = rms_norm(y, layer_params["pre_ffn_norm"])
+            y = model_norm(y, layer_params["pre_ffn_norm"])
         else:
             y = x + y
-            x = rms_norm(y, layer_params["post_attn_norm"])            
-        
-        y = ffn(y, layer_params["ffn"])
-        
+            x = model_norm(y, layer_params["post_attn_norm"])
+
+        y = ffn(y, layer_params["ffn"], config["act_fn"])
+
         if layer_params.get("post_ffn_norm"):
-            y = rms_norm(y, layer_params["post_ffn_norm"])
+            y = model_norm(y, layer_params["post_ffn_norm"])
 
         x = x + y
 
-    x = rms_norm(x, params["out_norm"])
+    x = model_norm(x, params["out_norm"])
 
-    if config["weight_tying"]:
+    if config["io_tying"]:
         outputs = decode(x, params["embed_table"])
     else:
         outputs = decode(x, params["lm_head"])
 
-    return outputs
+    return outputs, cache
