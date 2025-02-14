@@ -61,7 +61,7 @@ def params_to_lmkit(model_tensors):
             ("mlp", "ffn"),
             ("feedforward", "ffn"),
             ("layernorm", "norm"),
-            ("embed_tokens", "embed_table"),
+            ("embed_tokens", "embed_table")
         ]
 
         for old_str, new_str in replacement_rules:

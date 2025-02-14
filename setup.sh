@@ -10,7 +10,7 @@ else
 fi
 
 # Create the virtual environment using uv if the "venv" directory does not exist.
-if [ ! -d "venv" ]; then
+if [ ! -d ".venv" ]; then
   echo "Creating virtual environment with uv..."
   uv venv
 else
@@ -33,8 +33,8 @@ fi
 
 # Install Visual Studio Code extensions.
 echo "Installing Visual Studio Code extensions..."
-code --install-extension charliermarsh.ruff
 code --install-extension ms-python.python
 code --install-extension ms-toolsai.jupyter
+code --install-extension charliermarsh.ruff
 
 echo "Setup complete."
