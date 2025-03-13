@@ -21,31 +21,8 @@ def rms_norm(x, weight, eps=1e-6):
     orig_dtype = x.dtype
     x = x.astype(jnp.float32)
     normed = x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + eps)
-    out = normed * weight
-    return out.astype(orig_dtype)
-
-
-def rope(embeds, base):
-    seq_len, d_key = embeds.shape
-
-    half_dim = d_key // 2
-    positions = jnp.arange(seq_len)[:, None]
-    dim_idx = jnp.arange(half_dim)[None, :]
-
-    theta = base ** (-2 * dim_idx / d_key)
-
-    angles = positions * theta
-    cos = jnp.cos(angles)
-    sin = jnp.sin(angles)
-
-    comp1, comp2 = jnp.split(embeds, 2, axis=-1)
-
-    rotated_first = comp1 * cos - comp2 * sin
-    rotated_second = comp1 * sin + comp2 * cos
-
-    outputs = jnp.concatenate([rotated_first, rotated_second], axis=-1)
-
-    return jnp.astype(outputs, embeds.dtype)
+    out = weight * normed.astype(orig_dtype)
+    return out
 
 
 @partial(jax.jit, static_argnums=(2,))
@@ -57,22 +34,37 @@ def ffn(x, params, act_fn):
     return output
 
 
-@partial(jax.jit, static_argnums=(3,))
-def attention(inputs, lengths, params, config):
+def rope(x, cos, sin):
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    x_rot = jnp.concatenate([-x2, x1], axis=-1)
+    return ((x * cos) + (x_rot * sin)).astype(x.dtype)
+
+
+def build_rope_cache(seq_len, head_dim, base):
+    inv_freq = 1.0 / (base ** (jnp.arange(0, head_dim, 2) / head_dim))
+    positions = jnp.arange(seq_len)
+    angles = positions[:, None] * inv_freq[None, :]
+    angles = jnp.concatenate([angles, angles], axis=-1)
+    cos = jnp.cos(angles)
+    sin = jnp.sin(angles)
+    return cos, sin
+
+
+@partial(jax.jit, static_argnums=(4,))
+def attention(inputs, lengths, params, rope_cache, config):
     attn_impl = "cudnn" if has_cuda else "xla"
+    cos, sin = rope_cache
 
     query = jnp.einsum("ij,kj->ik", inputs, params["W_q"])
-    query = rope(query, config["rope_base"])
     query = rearrange(query, "t (n h) -> t n h", n=config["num_heads"])
+    query = rope(query, cos[:, None, :], sin[:, None, :])
 
     key = jnp.einsum("ij,kj->ik", inputs, params["W_k"])
-    key = rope(key, config["rope_base"])
     key = rearrange(key, "t (n h) -> t n h", n=config["num_kv_heads"])
+    key = rope(key, cos[:, None, :], sin[:, None, :])
 
     value = jnp.einsum("ij,kj->ik", inputs, params["W_v"])
     value = rearrange(value, "t (n h) -> t n h", n=config["num_kv_heads"])
-
-    # raise Exception(f"Query shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
 
     x = jax.nn.dot_product_attention(
         query=query,
@@ -93,20 +85,16 @@ def attention(inputs, lengths, params, config):
 @partial(jax.vmap, in_axes=(0, 0, None, None))
 def run_decoder(inputs, lengths, params, config):
     x = jnp.take(params["embed_table"], inputs, axis=0)
+    seq_len = x.shape[0]
+    head_dim = config["hidden_size"] // config["num_heads"]
 
-    for layer_id, layer_params in enumerate(params["layers"]):
-        # 1) Pre-attn norm
+    rope_cache = build_rope_cache(seq_len, head_dim, base=config["rope_base"])
+
+    for layer_params in params["layers"]:
         y = rms_norm(x, layer_params["input_norm"], eps=config["norm_eps"])
-
-        # 2) Self-attn
-        attn_out = attention(y, lengths, layer_params["attn"], config)
-        # 3) Residual
+        attn_out = attention(y, lengths, layer_params["attn"], rope_cache, config)
         x = x + attn_out
-
-        # 4) Post-attn norm
         y = rms_norm(x, layer_params["post_attn_norm"], eps=config["norm_eps"])
-
-        # 5) FFN
         ffn_out = ffn(y, layer_params["ffn"], config["act_fn"])
         x = x + ffn_out
 

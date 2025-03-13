@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import safetensors
 import tokenizers
+from einops import rearrange
 from flax.core.frozen_dict import freeze
 from tqdm import tqdm
 
@@ -61,7 +62,7 @@ def params_to_lmkit(model_tensors):
             ("mlp", "ffn"),
             ("feedforward", "ffn"),
             ("layernorm", "norm"),
-            ("embed_tokens", "embed_table")
+            ("embed_tokens", "embed_table"),
         ]
 
         for old_str, new_str in replacement_rules:
@@ -72,6 +73,9 @@ def params_to_lmkit(model_tensors):
     new_dict = {}
 
     for full_key, tensor in model_tensors.items():
+        # if tensor.ndim >= 2:
+        #     tensor = rearrange(tensor, "... i j -> ... j i")
+
         key = rename_key(full_key)
         parts = key.split(".")
 
@@ -105,7 +109,6 @@ def params_to_lmkit(model_tensors):
     def collapse_leaf_dicts(d):
         if isinstance(d, dict):
             new_d = {k: collapse_leaf_dicts(v) for k, v in d.items()}
-            # If the only key is "weight", return just the "weight" value
             if set(new_d.keys()) == {"weight"}:
                 return new_d["weight"]
             return new_d
