@@ -73,8 +73,8 @@ def params_to_lmkit(model_tensors):
     new_dict = {}
 
     for full_key, tensor in model_tensors.items():
-        # if tensor.ndim >= 2:
-        #     tensor = rearrange(tensor, "... i j -> ... j i")
+        if tensor.ndim >= 2 and "embed_tokens" not in full_key:
+            tensor = rearrange(tensor, "... i j -> ... j i")
 
         key = rename_key(full_key)
         parts = key.split(".")

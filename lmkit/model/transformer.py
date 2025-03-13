@@ -13,7 +13,7 @@ def encode(inputs, embed_table):
 
 
 def decode(inputs, lm_head):
-    logits = jnp.einsum("ij,kj->ik", inputs, lm_head)
+    logits = inputs @ lm_head
     return logits
 
 
@@ -27,10 +27,10 @@ def rms_norm(x, weight, eps=1e-6):
 
 @partial(jax.jit, static_argnums=(2,))
 def ffn(x, params, act_fn):
-    gate = jnp.einsum("ij,kj->ik", x, params["W_gate"])
+    gate = x @ params["W_gate"]
     act = act_fn(gate)
-    up = jnp.einsum("ij,kj->ik", x, params["W_up"])
-    output = jnp.einsum("ij,kj->ik", act * up, params["W_down"])
+    up = x @ params["W_up"]
+    output = (act * up) @ params["W_down"]
     return output
 
 
@@ -55,15 +55,15 @@ def attention(inputs, lengths, params, rope_cache, config):
     attn_impl = "cudnn" if has_cuda else "xla"
     cos, sin = rope_cache
 
-    query = jnp.einsum("ij,kj->ik", inputs, params["W_q"])
+    query = inputs @ params["W_q"]
     query = rearrange(query, "t (n h) -> t n h", n=config["num_heads"])
     query = rope(query, cos[:, None, :], sin[:, None, :])
 
-    key = jnp.einsum("ij,kj->ik", inputs, params["W_k"])
+    key = inputs @ params["W_k"]
     key = rearrange(key, "t (n h) -> t n h", n=config["num_kv_heads"])
     key = rope(key, cos[:, None, :], sin[:, None, :])
 
-    value = jnp.einsum("ij,kj->ik", inputs, params["W_v"])
+    value = inputs @ params["W_v"]
     value = rearrange(value, "t (n h) -> t n h", n=config["num_kv_heads"])
 
     x = jax.nn.dot_product_attention(
@@ -77,14 +77,14 @@ def attention(inputs, lengths, params, rope_cache, config):
     )
 
     x = rearrange(x, "t n h -> t (n h)")
-    x = jnp.einsum("ij,kj->ik", x, params["W_o"])
+    x = x @ params["W_o"]
 
     return x
 
 
 @partial(jax.vmap, in_axes=(0, 0, None, None))
 def run_decoder(inputs, lengths, params, config):
-    x = jnp.take(params["embed_table"], inputs, axis=0)
+    x = encode(inputs, params["embed_table"])
     seq_len = x.shape[0]
     head_dim = config["hidden_size"] // config["num_heads"]
 
