@@ -8,7 +8,7 @@ has_cuda = jax.default_backend == "gpu"
 
 
 def encode(inputs, embed_table):
-    embeddings = jnp.take(embed_table, inputs, axis=0)
+    embeddings = jnp.take(embed_table, inputs, axis=0, fill_value=0)
     return embeddings
 
 
@@ -40,9 +40,8 @@ def rope(x, cos, sin):
     return ((x * cos) + (x_rot * sin)).astype(x.dtype)
 
 
-def build_rope_cache(seq_len, head_dim, base):
+def build_rope_cache(positions, head_dim, base):
     inv_freq = 1.0 / (base ** (jnp.arange(0, head_dim, 2) / head_dim))
-    positions = jnp.arange(seq_len)
     angles = positions[:, None] * inv_freq[None, :]
     angles = jnp.concatenate([angles, angles], axis=-1)
     cos = jnp.cos(angles)
@@ -51,7 +50,7 @@ def build_rope_cache(seq_len, head_dim, base):
 
 
 @partial(jax.jit, static_argnums=(4,))
-def attention(inputs, lengths, params, rope_cache, config):
+def attention(inputs, seq_len, params, rope_cache, config):
     attn_impl = "cudnn" if has_cuda else "xla"
     cos, sin = rope_cache
 
@@ -71,8 +70,8 @@ def attention(inputs, lengths, params, rope_cache, config):
         key=key,
         value=value,
         is_causal=True,
-        query_seq_lengths=lengths,
-        key_value_seq_lengths=lengths,
+        query_seq_lengths=seq_len,
+        key_value_seq_lengths=seq_len,
         implementation=attn_impl,
     )
 
@@ -83,16 +82,17 @@ def attention(inputs, lengths, params, rope_cache, config):
 
 
 @partial(jax.vmap, in_axes=(0, 0, None, None))
-def run_decoder(inputs, lengths, params, config):
-    x = encode(inputs, params["embed_table"])
-    seq_len = x.shape[0]
+def run_decoder(inputs, positions, params, config):
     head_dim = config["hidden_size"] // config["num_heads"]
+    seq_len = jnp.sum(positions >= 0).astype(jnp.int32)[..., None]
 
-    rope_cache = build_rope_cache(seq_len, head_dim, base=config["rope_base"])
+    x = encode(inputs, params["embed_table"])
+
+    rope_cache = build_rope_cache(positions, head_dim, base=config["rope_base"])
 
     for layer_params in params["layers"]:
         y = rms_norm(x, layer_params["input_norm"], eps=config["norm_eps"])
-        attn_out = attention(y, lengths, layer_params["attn"], rope_cache, config)
+        attn_out = attention(y, seq_len, layer_params["attn"], rope_cache, config)
         x = x + attn_out
         y = rms_norm(x, layer_params["post_attn_norm"], eps=config["norm_eps"])
         ffn_out = ffn(y, layer_params["ffn"], config["act_fn"])
