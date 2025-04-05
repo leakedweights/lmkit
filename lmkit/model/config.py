@@ -1,16 +1,5 @@
 from flax.core import FrozenDict
 
-def extend_gemma2(base_config):
-    return FrozenDict(
-        {
-            **base_config,
-            "norm_convert_w": True,
-            "norm_w_bias": 1.0,
-            "pre_ffn_norm": True,
-            "post_ffn_norm": True,
-        }
-    )
-
 
 def extend_llama(base_config):
     return FrozenDict(
