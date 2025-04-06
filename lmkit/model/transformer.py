@@ -123,3 +123,106 @@ def run(inputs, cache, params, config):
     if cache.use_kv:
         cache = cache.replace(layers=new_layer_cache)
     return logits, cache
+
+
+def create(key, config, dtype=jnp.bfloat16, stddev=0.006):
+    def normal_init(key, shape, dim_in, stddev=None, dtype=jnp.float32):
+        if stddev is None:
+            stddev = 1.0 / jnp.sqrt(dim_in)
+        return stddev * jax.random.normal(key, shape, dtype=dtype)
+
+    def ones_init(shape, dtype=jnp.float32):
+        return jnp.ones(shape, dtype=dtype)
+
+    hidden_size = config["hidden_size"]
+    vocab_size = config["vocab_size"]
+    num_layers = config["num_layers"]
+    num_heads = config["num_heads"]
+    num_kv_heads = config.get("num_kv_heads", num_heads)
+    intermediate_size = config["intermediate_size"]
+    head_dim = config.get("head_dim", hidden_size // num_heads)
+
+    keys = jax.random.split(
+        key, num_layers + 3
+    )  # Keys for layers + embed + out_norm + lm_head
+    params = {}
+
+    # Embedding table
+    params["embed_table"] = normal_init(
+        keys[0],
+        (vocab_size, hidden_size),
+        hidden_size,
+        stddev=stddev,
+        dtype=dtype,
+    )
+
+    # Transformer Layers
+    params["layers"] = []
+    layer_keys = jax.random.split(keys[1], num_layers)
+    for i in range(num_layers):
+        layer_key = layer_keys[i]
+        attn_key, ffn_key = jax.random.split(layer_key, 2)
+        attn_q_key, attn_k_key, attn_v_key, attn_o_key = jax.random.split(attn_key, 4)
+        ffn_g_key, ffn_u_key, ffn_d_key = jax.random.split(ffn_key, 3)
+
+        layer_params = {
+            "input_norm": ones_init(
+                (hidden_size,), dtype=dtype
+            ),  # RMSNorm weight init to 1
+            "attn": {
+                "W_q": normal_init(
+                    attn_q_key,
+                    (hidden_size, num_heads * head_dim),
+                    hidden_size,
+                    dtype=dtype,
+                ),
+                "W_k": normal_init(
+                    attn_k_key,
+                    (hidden_size, num_kv_heads * head_dim),
+                    hidden_size,
+                    dtype=dtype,
+                ),
+                "W_v": normal_init(
+                    attn_v_key,
+                    (hidden_size, num_kv_heads * head_dim),
+                    hidden_size,
+                    dtype=dtype,
+                ),
+                "W_o": normal_init(
+                    attn_o_key,
+                    (num_heads * head_dim, hidden_size),
+                    num_heads * head_dim,
+                    dtype=dtype,
+                ),
+            },
+            "post_attn_norm": ones_init((hidden_size,), dtype=dtype),
+            "ffn": {
+                "W_gate": normal_init(
+                    ffn_g_key,
+                    (hidden_size, intermediate_size),
+                    hidden_size,
+                    dtype=dtype,
+                ),
+                "W_up": normal_init(
+                    ffn_u_key,
+                    (hidden_size, intermediate_size),
+                    hidden_size,
+                    dtype=dtype,
+                ),
+                "W_down": normal_init(
+                    ffn_d_key,
+                    (intermediate_size, hidden_size),
+                    intermediate_size,
+                    dtype=dtype,
+                ),
+            },
+        }
+        params["layers"].append(layer_params)
+
+    params["out_norm"] = ones_init((hidden_size,), dtype=dtype)
+
+    params["lm_head"] = normal_init(
+        keys[-1], (hidden_size, vocab_size), hidden_size, dtype=dtype
+    )
+
+    return params
