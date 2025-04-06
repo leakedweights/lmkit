@@ -1,59 +1,56 @@
-import jax
 import jax.numpy as jnp
-from jax import random
-from flax.core import FrozenDict
+from tqdm.auto import tqdm
 
-from lmkit.model import transformer
+from . import transformer
+from .caching import TransformerCache
 
-def init_cache(config):
-    return FrozenDict({}) # todo
-
-def generate(key, start_sequences, params, config, tokenizer, max_steps, batch_size, temperature):
-    max_len = max_steps + 1
-
-    def continue_generation(carry):
-        step, _, seq, *_ = carry
-        not_at_max = step <= max_len
-        all_finished = jnp.all(jnp.any(seq == tokenizer.eos_token_id, axis=1))
-        return not_at_max & (~all_finished)
-
-    def sample_fn(carry):
-        step, key, inputs, lengths, cache = carry
-
-        outputs, cache = transformer.run_decoder(inputs, lengths, cache, params, config)
-        logits = outputs[:, step, :]
-
-        gumbel_key = random.fold_in(key, step + 1)
-        gumbel_noise = -jnp.log(-jnp.log(random.uniform(gumbel_key, logits.shape)))
-
-        noisy_logits = logits + gumbel_noise
-        if temperature > 0:
-            noisy_logits = noisy_logits / temperature
-
-        if temperature == 0:
-            sample = jnp.argmax(noisy_logits, axis=-1)
-        else:
-            sample = random.categorical(key, noisy_logits, axis=-1)
-
-        new_inputs = inputs.at[:, step + 1].set(sample)
-        new_cache = cache
-
-        return (step + 1, key, new_inputs, lengths+1, new_cache)
-
-    step = 0
-    cache = None
-    start_lengths = jnp.array([len(seq) for seq in start_sequences])
-    inputs = jnp.full((batch_size, max_len), tokenizer.pad_token_id)
-    for i, seq in enumerate(start_sequences):
-        seq_array = jnp.array(seq)
-        seq_len = seq_array.shape[0]
-        inputs = inputs.at[i, :seq_len].set(seq_array)
+# TODO: replace greedy decoding with temperature sampling
+# TODO: add break upon EOS token
 
 
-    loop_inputs = (step, key, inputs, start_lengths, cache)
+def generate(
+    inputs, max_new_tokens, tokenizer, params, config, return_text=True, verbose=False
+):
+    batch_size = len(inputs)
 
-    final_step, _, outputs, _, _ = jax.lax.while_loop(
-        continue_generation, sample_fn, loop_inputs
+    encodings = tokenizer.encode_batch_fast(inputs)
+    tokens = jnp.array([enc.ids for enc in encodings])
+    tokens = jnp.concatenate(
+        [tokens, tokenizer.pad_token_id * jnp.ones((batch_size, max_new_tokens))],
+        axis=-1,
+    ).astype(jnp.int32)
+    positions = jnp.where(
+        tokens != tokenizer.pad_token_id, jnp.arange(tokens.shape[-1]), -1
+    )
+    seq_lens = jnp.sum(positions >= 0, axis=-1)
+
+    model_inputs = tokens
+
+    cache = TransformerCache.initialize(
+        batch_size=batch_size,
+        current_positions=positions,
+        config=config,
+        max_total_length=jnp.max(seq_lens + max_new_tokens),
+        use_kv=True,
     )
 
-    return final_step, outputs
+    step_iter = range(max_new_tokens)
+    if verbose:
+        step_iter = tqdm(step_iter)
+
+    for _ in step_iter:
+        logits, cache = transformer.run(model_inputs, cache, params, config)
+        next_token_logits = logits[jnp.arange(batch_size), seq_lens - 1, :]
+        next_tokens = jnp.argmax(next_token_logits, axis=-1)
+
+        batch_indices = jnp.arange(batch_size).astype(jnp.int32)
+        tokens = tokens.at[batch_indices, seq_lens].set(next_tokens)
+        model_inputs = next_tokens[..., None] if cache.use_kv else tokens
+        cache = cache.roll()
+        seq_lens += 1
+
+    if return_text:
+        return tokenizer.decode_batch(
+            jnp.where(tokens >= 0, tokens, tokenizer.pad_token_id)
+        )
+    return tokens
