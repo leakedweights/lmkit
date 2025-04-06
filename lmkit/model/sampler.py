@@ -1,15 +1,49 @@
+import jax
 import jax.numpy as jnp
+from jax import random
 from tqdm.auto import tqdm
 
 from . import transformer
 from .caching import TransformerCache
 
-# TODO: replace greedy decoding with temperature sampling
-# TODO: add break upon EOS token
+
+def sample_step(logits, random_key, top_p, temp):
+    logits = logits / temp
+
+    sorted_indices = jnp.argsort(logits, axis=-1)[..., ::-1]
+    sorted_logits = jnp.sort(logits, axis=-1)[..., ::-1]
+
+    cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
+
+    cutoff = cumulative_probs > top_p
+    cutoff = jnp.pad(cutoff[..., :-1], ((0, 0), (1, 0)), constant_values=False)
+
+    masked_logits = jnp.where(cutoff, -jnp.inf, sorted_logits)
+
+    sampled_indices_in_sorted = jax.random.categorical(
+        random_key, masked_logits, axis=-1
+    )
+
+    next_token = jnp.take_along_axis(
+        sorted_indices,
+        sampled_indices_in_sorted[..., None],
+        axis=-1,
+    ).squeeze(-1)
+
+    return next_token
 
 
 def generate(
-    inputs, max_new_tokens, tokenizer, params, config, return_text=True, verbose=False
+    inputs,
+    max_new_tokens,
+    tokenizer,
+    params,
+    config,
+    random_key,
+    temp=0.6,
+    top_p=0.9,
+    return_text=True,
+    verbose=False,
 ):
     batch_size = len(inputs)
 
@@ -38,10 +72,14 @@ def generate(
     if verbose:
         step_iter = tqdm(step_iter)
 
-    for _ in step_iter:
+    for step in step_iter:
         logits, cache = transformer.run(model_inputs, cache, params, config)
         next_token_logits = logits[jnp.arange(batch_size), seq_lens - 1, :]
-        next_tokens = jnp.argmax(next_token_logits, axis=-1)
+
+        step_key = random.fold_in(random_key, step)
+        next_tokens = sample_step(
+            logits=next_token_logits, random_key=step_key, top_p=top_p, temp=temp
+        )
 
         batch_indices = jnp.arange(batch_size).astype(jnp.int32)
         tokens = tokens.at[batch_indices, seq_lens].set(next_tokens)
