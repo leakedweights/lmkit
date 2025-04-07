@@ -6,6 +6,8 @@ from tqdm.auto import tqdm
 from . import transformer
 from .caching import TransformerCache
 
+# TODO: add stopping on EOS token
+
 
 def sample_step(logits, random_key, top_p, temp):
     logits = logits / temp

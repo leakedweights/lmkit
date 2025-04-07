@@ -166,20 +166,27 @@ def load_lmkit_config(config_file):
 
 
 def load_lmkit_tokenizer(
-    tokenizer_path, generation_config_path=None, pad_token="<|pad|>"
+    tokenizer_path,
+    pad_token="<pad>",
+    generation_config_file=None,
+    generation_config=None,
 ):
     tokenizer = tokenizers.Tokenizer.from_file(tokenizer_path)
-    if generation_config_path is not None:
-        with open(generation_config_path) as file:
+    if generation_config_file is not None:
+        with open(generation_config_file) as file:
             generation_config = json.load(file)
+    elif generation_config is None:
+        raise ValueError(
+            "Either generation_config_file or generation_config must be provided."
+        )
 
-        bos = generation_config["bos_token_id"]
-        eos = generation_config["bos_token_id"]
-        tokenizer.bos_token_id = bos[0] if isinstance(bos, list) else bos
-        tokenizer.eos_token_id = eos[0] if isinstance(eos, list) else eos
+    bos = generation_config["bos_token_id"]
+    eos = generation_config["bos_token_id"]
+    tokenizer.bos_token_id = bos[0] if isinstance(bos, list) else bos
+    tokenizer.eos_token_id = eos[0] if isinstance(eos, list) else eos
 
-        tokenizer.add_special_tokens([pad_token])
-        tokenizer.pad_token_id = tokenizer.token_to_id(pad_token)
-        tokenizer.enable_padding(pad_id=tokenizer.pad_token_id, pad_token=pad_token)
+    tokenizer.add_special_tokens([pad_token])
+    tokenizer.pad_token_id = tokenizer.token_to_id(pad_token)
+    tokenizer.enable_padding(pad_id=tokenizer.pad_token_id, pad_token=pad_token)
 
     return tokenizer

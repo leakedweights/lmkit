@@ -126,7 +126,7 @@ def run(inputs, cache, params, config):
 
 
 def create(key, config, dtype=jnp.bfloat16, stddev=0.006):
-    def normal_init(key, shape, dim_in, stddev=None, dtype=jnp.float32):
+    def normal_init(key, shape, dim_in, stddev, dtype=jnp.float32):
         if stddev is None:
             stddev = 1.0 / jnp.sqrt(dim_in)
         return stddev * jax.random.normal(key, shape, dtype=dtype)
