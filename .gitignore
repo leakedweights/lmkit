@@ -1,5 +1,7 @@
 data
 models
+checkpoints
+
 .env
 
 # Byte-compiled / optimized / DLL files

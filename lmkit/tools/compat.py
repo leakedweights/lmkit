@@ -8,6 +8,7 @@ import safetensors
 import tokenizers
 from einops import rearrange
 from flax.core.frozen_dict import freeze
+from tokenizers.processors import TemplateProcessing
 from tqdm import tqdm
 
 
@@ -165,12 +166,7 @@ def load_lmkit_config(config_file):
     return new_config
 
 
-def load_lmkit_tokenizer(
-    tokenizer_path,
-    pad_token="<pad>",
-    generation_config_file=None,
-    generation_config=None,
-):
+def to_lmkit_tokenizer(tokenizer_path, generation_config_file=None, pad_token="<pad>"):
     tokenizer = tokenizers.Tokenizer.from_file(tokenizer_path)
     if generation_config_file is not None:
         with open(generation_config_file) as file:
@@ -188,5 +184,62 @@ def load_lmkit_tokenizer(
     tokenizer.add_special_tokens([pad_token])
     tokenizer.pad_token_id = tokenizer.token_to_id(pad_token)
     tokenizer.enable_padding(pad_id=tokenizer.pad_token_id, pad_token=pad_token)
+
+    return tokenizer
+
+
+def load_tokenizer(
+    tokenizer_path,
+    mode: str = "inference",
+    generation_config=None,
+    generation_config_file=None,
+):
+    if generation_config is None and generation_config_file is None:
+        raise ValueError(
+            "Either generation_config or generation_config_file must be provided."
+        )
+
+    if generation_config_file is not None:
+        with open(generation_config_file) as file:
+            generation_config = json.load(file)
+
+    tokenizer = tokenizers.Tokenizer.from_file(tokenizer_path)
+    tokenizer.vocab_size = generation_config.get(
+        "vocab_size", tokenizer.get_vocab_size()
+    )
+    pad_token = generation_config["pad_token"]
+    tokenizer.add_special_tokens([pad_token])
+
+    bos_token = generation_config["bos_token"]
+    eos_token = generation_config["eos_token"]
+    pad_token = generation_config["pad_token"]
+
+    tokenizer.bos_token_id = tokenizer.token_to_id(bos_token)
+    tokenizer.eos_token_id = tokenizer.token_to_id(eos_token)
+    tokenizer.pad_token_id = tokenizer.token_to_id(pad_token)
+
+    tokenizer.enable_padding(
+        pad_id=tokenizer.pad_token_id,
+        pad_token=pad_token,
+    )
+
+    if mode == "train":
+        tokenizer.post_processor = TemplateProcessing(
+            single=f"{bos_token} $A {eos_token}",
+            pair=f"{bos_token} $A {eos_token} {bos_token} $B {eos_token}",
+            special_tokens=[
+                (bos_token, tokenizer.bos_token_id),
+                (eos_token, tokenizer.eos_token_id),
+            ],
+        )
+        print("Applied 'train' post-processor (BOS+EOS).")
+    elif mode == "inference":
+        tokenizer.post_processor = TemplateProcessing(
+            single=f"{bos_token} $A",
+            special_tokens=[
+                (bos_token, tokenizer.bos_token_id),
+            ],
+        )
+        print("Applied 'inference' post-processor (BOS only).")
 
     return tokenizer

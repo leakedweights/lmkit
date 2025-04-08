@@ -1,3 +1,4 @@
+import logging
 from functools import partial
 
 import jax
@@ -118,7 +119,13 @@ def run(inputs, cache, params, config):
         x = x + ffn_out
 
     x = rms_norm(x, params["out_norm"], eps=config["norm_eps"])
-    logits = x @ params["lm_head"]
+
+    if not config.get("io_tying"):
+        lm_head = params["embed_table"].T
+    else:
+        lm_head = params["lm_head"]
+
+    logits = x @ lm_head
 
     if cache.use_kv:
         cache = cache.replace(layers=new_layer_cache)
@@ -126,7 +133,7 @@ def run(inputs, cache, params, config):
 
 
 def create(key, config, dtype=jnp.bfloat16, stddev=0.006):
-    def normal_init(key, shape, dim_in, stddev, dtype=jnp.float32):
+    def normal_init(key, shape, dim_in, stddev=None, dtype=jnp.float32):
         if stddev is None:
             stddev = 1.0 / jnp.sqrt(dim_in)
         return stddev * jax.random.normal(key, shape, dtype=dtype)
@@ -142,12 +149,9 @@ def create(key, config, dtype=jnp.bfloat16, stddev=0.006):
     intermediate_size = config["intermediate_size"]
     head_dim = config.get("head_dim", hidden_size // num_heads)
 
-    keys = jax.random.split(
-        key, num_layers + 3
-    )  # Keys for layers + embed + out_norm + lm_head
+    keys = jax.random.split(key, num_layers + 3)
     params = {}
 
-    # Embedding table
     params["embed_table"] = normal_init(
         keys[0],
         (vocab_size, hidden_size),
@@ -156,7 +160,6 @@ def create(key, config, dtype=jnp.bfloat16, stddev=0.006):
         dtype=dtype,
     )
 
-    # Transformer Layers
     params["layers"] = []
     layer_keys = jax.random.split(keys[1], num_layers)
     for i in range(num_layers):
@@ -166,9 +169,7 @@ def create(key, config, dtype=jnp.bfloat16, stddev=0.006):
         ffn_g_key, ffn_u_key, ffn_d_key = jax.random.split(ffn_key, 3)
 
         layer_params = {
-            "input_norm": ones_init(
-                (hidden_size,), dtype=dtype
-            ),  # RMSNorm weight init to 1
+            "input_norm": ones_init((hidden_size,), dtype=dtype),
             "attn": {
                 "W_q": normal_init(
                     attn_q_key,
@@ -221,8 +222,14 @@ def create(key, config, dtype=jnp.bfloat16, stddev=0.006):
 
     params["out_norm"] = ones_init((hidden_size,), dtype=dtype)
 
-    params["lm_head"] = normal_init(
-        keys[-1], (hidden_size, vocab_size), hidden_size, dtype=dtype
+    if not config.get("io_tying"):
+        params["lm_head"] = normal_init(
+            keys[-1], (hidden_size, vocab_size), hidden_size, dtype=dtype
+        )
+
+    num_params = sum(x.size for x in jax.tree.leaves(params))
+    logging.info(
+        f"Created transformer with {num_params}, hidden size: {hidden_size}, layers: {num_layers}"
     )
 
     return params

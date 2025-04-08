@@ -1,15 +1,23 @@
+import json
+import logging
+import os
+import pickle
+import time
+from functools import partial
+from typing import Iterator, List, Optional
+
 import jax
 import jax.numpy as jnp
 import optax
-import pickle
-import os
-import time
+from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+from tokenizers.models import BPE
+from tokenizers.normalizers import NFD, Lowercase, Sequence, StripAccents
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.trainers import BpeTrainer
 from tqdm.auto import tqdm
-import logging
-from functools import partial
 
-from . import transformer
-from . import caching
+from ..model import caching, transformer
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -44,16 +52,24 @@ def load_checkpoint(checkpoint_path):
 
 
 def compute_metrics(logits, targets, mask):
-    mask = mask.astype(jnp.bool_)
-    num_valid_tokens = jnp.maximum(jnp.sum(mask), 1)
+    vocab_size = logits.shape[-1]
 
-    per_token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-    masked_loss = per_token_loss * mask
+    valid_target_mask = (targets >= 0) & (targets < vocab_size)
+    final_mask = mask & valid_target_mask
+    final_mask = final_mask.astype(jnp.bool_)
+
+    num_valid_tokens = jnp.maximum(jnp.sum(final_mask), 1)
+    safe_targets = jnp.where(final_mask, targets, 0)
+
+    per_token_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits, safe_targets
+    )
+
+    masked_loss = per_token_loss * final_mask
     mean_loss = jnp.sum(masked_loss) / num_valid_tokens
 
-    # Accuracy Calculation (Optional but good to have)
     predictions = jnp.argmax(logits, axis=-1)
-    correct_predictions = (predictions == targets) * mask
+    correct_predictions = (predictions == targets) * final_mask
     accuracy = jnp.sum(correct_predictions) / num_valid_tokens
 
     metrics = {
@@ -70,64 +86,65 @@ def log_weights_biases_norms(params, step):
     )
 
     global_param_norm = optax.global_norm(params)
-    logging.info(f"[Step {step}] Global Param Norm: {global_param_norm:.4f}")
+    logging.info(f"[Step {step}] Global Param Norm: {global_param_norm.item():.4f}")
 
     if "embed_table" in params:
         logging.info(
-            f"[Step {step}] Norm(embed_table): {param_norms['embed_table']:.4f}"
+            f"[Step {step}] Norm(embed_table): {param_norms['embed_table'].item():.4f}"
         )
     if "layers" in params and len(params["layers"]) > 0:
         layer0_attn = params["layers"][0].get("attn", {})
         for w_name in ["W_q", "W_k", "W_v", "W_o"]:
             if w_name in layer0_attn:
                 logging.info(
-                    f"[Step {step}] Norm(layer0.attn.{w_name}): {param_norms['layers'][0]['attn'][w_name]:.4f}"
+                    f"[Step {step}] Norm(layer0.attn.{w_name}): {param_norms['layers'][0]['attn'][w_name].item():.4f}"
                 )
+
 
 # --- Training Step Function ---
 
-
-@partial(jax.jit, static_argnums=(3,))
+@partial(jax.jit, static_argnums=(3, 4))
 def train_step(params, opt_state, batch, config, optimizer):
-
-    # --- Loss Function Definition (inside train_step for closure) ---
     def loss_fn(p):
         input_ids = batch["input_ids"]
         targets = batch["target_ids"]
-        positions = batch[
-            "positions"
-        ]
+        positions = batch["positions"]
         batch_size, seq_len = input_ids.shape
 
-        cache = caching.TransformerCache.initialize(
-            batch_size=batch_size,
-            current_positions=positions,
-            config=config,
-            max_total_length=seq_len,
-            use_kv=False,
+        head_dim = config["hidden_size"] // config["num_heads"]
+
+        sin, cos = caching.build_rope(
+            positions=positions,
+            head_dim=head_dim,
+            base=config["rope_base"],
         )
 
-        # Forward pass
+        cache = caching.TransformerCache(
+            use_kv=False,
+            full_sin=sin,
+            full_cos=cos,
+            full_positions=positions,
+            layers=[
+                caching.LayerCache(
+                    sin=sin,
+                    cos=cos,
+                    positions=positions,
+                    cached_lens=jnp.zeros((batch_size,), dtype=jnp.int32),
+                    keys=None,
+                    values=None,
+                )
+                for _ in range(config["num_layers"])
+            ],
+        )
+
         logits, _ = transformer.run(input_ids, cache, p, config)
-
-        # Create mask: True for valid positions (>= 0), False for padding (-1)
         mask = positions >= 0
-
-        # Compute loss (and optionally accuracy) using the mask
         metrics = compute_metrics(logits, targets, mask)
-        return metrics["loss"], metrics  # Return loss and other metrics
+        return metrics["loss"], metrics
 
-    # --- Gradient Calculation and Parameter Update ---
-    # Calculate loss, metrics, and gradients
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-
-    # Compute updates based on gradients
     updates, new_opt_state = optimizer.update(grads, opt_state, params)
-
-    # Apply updates to parameters
     new_params = optax.apply_updates(params, updates)
-
-    # Add gradient norm to metrics for logging
     metrics["grad_norm"] = optax.global_norm(grads)
 
     return new_params, new_opt_state, metrics
@@ -135,9 +152,9 @@ def train_step(params, opt_state, batch, config, optimizer):
 
 # --- Main Training Function ---
 
-def train(
+def train_model(
     config: dict,
-    data_iterator: iter,  # Should yield dictionaries like {'input_ids': ..., 'target_ids': ..., 'positions': ...}
+    data_iterator: iter,
     num_steps: int,
     learning_rate: float = 1e-4,
     log_every: int = 100,
@@ -153,15 +170,14 @@ def train(
     key = jax.random.PRNGKey(seed)
     model_key, init_key = jax.random.split(key)
 
-    # Initialize parameters or load from checkpoint
     start_step = 0
     if resume_from and os.path.exists(resume_from):
         logging.info(f"Attempting to resume from checkpoint: {resume_from}")
         params, opt_state, start_step = load_checkpoint(resume_from)
-        if params is None:  # Check if loading failed
+        if params is None:
             logging.warning("Checkpoint loading failed, initializing from scratch.")
             params = transformer.create(model_key, config)
-            opt_state = None  # Will be initialized below
+            opt_state = None
             start_step = 0
         else:
             logging.info(f"Resumed training from step {start_step}")
@@ -173,13 +189,9 @@ def train(
         else:
             logging.info("Initializing new model parameters.")
         params = transformer.create(model_key, config)
-        opt_state = None  # Will be initialized below
+        opt_state = None
 
-    # Initialize Optimizer (Adam with standard settings)
-    # You can customize b1, b2, eps if needed, but these are standard.
     optimizer = optax.adam(learning_rate=learning_rate, b1=0.9, b2=0.999, eps=1e-8)
-
-    # Initialize optimizer state if not loaded from checkpoint
     if opt_state is None:
         opt_state = optimizer.init(params)
 
@@ -199,19 +211,17 @@ def train(
 
         try:
             batch = next(data_iterator)
-            # Ensure batch arrays are JAX arrays (might already be)
             batch = jax.tree_util.tree_map(jnp.asarray, batch)
         except StopIteration:
             logging.warning("Data iterator exhausted. Stopping training.")
             break
 
-        # Perform one training step
         params, opt_state, metrics = train_step(
             params, opt_state, batch, config, optimizer
         )
 
-        # Ensure metrics are concrete values for logging (move from device)
         metrics = jax.device_get(metrics)
+        metrics = jax.tree.map(float, metrics)
         step_time = time.time() - start_time
 
         # --- Logging ---
@@ -219,7 +229,7 @@ def train(
             log_message = (
                 f"[Step {step + 1}/{num_steps}] "
                 f"Loss: {metrics['loss']:.4f}, "
-                f"Acc: {metrics.get('accuracy', -1):.3f}, "  # Use .get in case accuracy isn't computed
+                f"Acc: {metrics.get('accuracy', -1):.3f}, "
                 f"Grad Norm: {metrics['grad_norm']:.4f}, "
                 f"Valid Tokens: {metrics['num_valid_tokens']:.0f}, "
                 f"Time/Step: {step_time:.3f}s"
@@ -229,15 +239,95 @@ def train(
                 loss=f"{metrics['loss']:.4f}", acc=f"{metrics.get('accuracy', -1):.3f}"
             )
 
-            # Log weight/bias norms
             log_weights_biases_norms(params, step + 1)
 
-        # --- Checkpointing ---
         if (step + 1) % save_every == 0:
             save_checkpoint(params, opt_state, step + 1, checkpoint_dir)
 
     logging.info("Training finished.")
-    # Save final checkpoint
+
     save_checkpoint(params, opt_state, num_steps, checkpoint_dir)
 
     return params, opt_state
+
+
+# --- Tokenizer training function ---
+
+def train_tokenizer(
+    iterator: Iterator[str],
+    vocab_size: int,
+    save_dir: str,
+    generation_config: dict,
+    initial_alphabet: Optional[List[str]] = None,
+    min_frequency: int = 2,
+    special_tokens: Optional[List[str]] = None,
+    add_prefix_space: bool = False,
+    normalize: bool = True,
+) -> Tokenizer:
+    unk_token = generation_config.setdefault("unk_token", "<unk>")
+    generation_config.setdefault("pad_token", "<pad>")
+    bos_token = generation_config.setdefault("bos_token", "<bos>")
+    eos_token = generation_config.setdefault("eos_token", "<eos>")
+
+    default_special_tokens = [unk_token, bos_token, eos_token]
+
+    if special_tokens is None:
+        special_tokens = default_special_tokens
+    else:
+        existing_tokens = set(special_tokens)
+        for token in default_special_tokens:
+            if token not in existing_tokens:
+                special_tokens.append(token)
+        if unk_token not in special_tokens:
+            special_tokens.insert(0, unk_token)
+
+    tokenizer = Tokenizer(BPE(unk_token=unk_token))
+
+    if normalize:
+        tokenizer.normalizer = Sequence(
+            [
+                NFD(),
+                Lowercase(),
+                StripAccents(),
+            ]
+        )
+
+    tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=add_prefix_space)
+    tokenizer.decoder = ByteLevelDecoder()
+
+    if initial_alphabet is None:
+        initial_alphabet = ByteLevel.alphabet()
+
+    trainer = BpeTrainer(
+        vocab_size=vocab_size,
+        min_frequency=min_frequency,
+        special_tokens=special_tokens,
+        initial_alphabet=initial_alphabet,
+        show_progress=True,
+    )
+
+    logging.info("Starting BPE tokenizer training...")
+    logging.info(f"Vocab size: {vocab_size}, Min frequency: {min_frequency}")
+    logging.info(f"Special tokens: {special_tokens}")
+    logging.info(f"Saving tokenizer assets to directory: {save_dir}")
+
+    tokenizer.train_from_iterator(iterator, trainer=trainer)
+
+    logging.info("Training complete.")
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        logging.info(f"Ensured directory exists: {save_dir}")
+
+    tokenizer_file_path = os.path.join(save_dir, "tokenizer.json")
+    generation_config_file_path = os.path.join(save_dir, "generation_config.json")
+
+    tokenizer.save(tokenizer_file_path)
+    logging.info(f"Tokenizer saved successfully to {tokenizer_file_path}")
+
+    with open(generation_config_file_path, "w", encoding="utf-8") as f:
+        json.dump(
+            generation_config, f, indent=2, ensure_ascii=False
+        )
+
+    return tokenizer
