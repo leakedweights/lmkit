@@ -1,4 +1,3 @@
-import logging
 from functools import partial
 
 import jax
@@ -120,7 +119,7 @@ def run(inputs, cache, params, config):
 
     x = rms_norm(x, params["out_norm"], eps=config["norm_eps"])
 
-    if not config.get("io_tying"):
+    if config.get("io_tying", False):
         lm_head = params["embed_table"].T
     else:
         lm_head = params["lm_head"]
@@ -222,14 +221,9 @@ def create(key, config, dtype=jnp.bfloat16, stddev=0.006):
 
     params["out_norm"] = ones_init((hidden_size,), dtype=dtype)
 
-    if not config.get("io_tying"):
+    if config.get("io_tying", False):
         params["lm_head"] = normal_init(
             keys[-1], (hidden_size, vocab_size), hidden_size, dtype=dtype
         )
-
-    num_params = sum(x.size for x in jax.tree.leaves(params))
-    logging.info(
-        f"Created transformer with {num_params}, hidden size: {hidden_size}, layers: {num_layers}"
-    )
 
     return params

@@ -1,3 +1,5 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -6,9 +8,8 @@ from tqdm.auto import tqdm
 from . import transformer
 from .caching import TransformerCache
 
-# TODO: add stopping on EOS token
 
-
+@partial(jax.jit, static_argnums=(2, 3))
 def sample_step(logits, random_key, top_p, temp):
     logits = logits / temp
 
@@ -36,21 +37,29 @@ def sample_step(logits, random_key, top_p, temp):
 
 
 def generate(
-    inputs,
     max_new_tokens,
     tokenizer,
     params,
     config,
     random_key,
+    inputs=None,
+    tokenized_inputs=None,
     temp=0.6,
     top_p=0.9,
     return_text=True,
     verbose=False,
 ):
-    batch_size = len(inputs)
+    if inputs is None:
+        if tokenized_inputs is None:
+            raise ValueError("Either raw inputs or encoded inputs must be specified")
 
-    encodings = tokenizer.encode_batch_fast(inputs)
-    tokens = jnp.array([enc.ids for enc in encodings])
+        batch_size = tokenized_inputs.shape[0]
+        tokens = tokenized_inputs
+    else:
+        batch_size = len(inputs)
+        encodings = tokenizer.encode_batch_fast(inputs)
+        tokens = tokens = jnp.array([enc.ids for enc in encodings])
+
     tokens = jnp.concatenate(
         [tokens, tokenizer.pad_token_id * jnp.ones((batch_size, max_new_tokens))],
         axis=-1,
@@ -85,6 +94,7 @@ def generate(
 
         batch_indices = jnp.arange(batch_size).astype(jnp.int32)
         tokens = tokens.at[batch_indices, seq_lens].set(next_tokens)
+
         model_inputs = next_tokens[..., None] if cache.use_kv else tokens
         cache = cache.roll()
         seq_lens += 1
